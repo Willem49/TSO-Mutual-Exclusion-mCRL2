@@ -1,0 +1,226 @@
+sort
+	TID = Nat;
+	ADR = Nat;
+map
+    MIN_TID, MAX_TID: TID;
+	MIN_ADR, MAX_ADR: ADR;
+    valid_tid: TID -> Bool;
+	valid_adr: ADR -> Bool;
+	MAX_BUFFER: Nat;
+var
+    tid: TID;
+	adr: ADR;
+eqn
+    valid_tid(tid) = MIN_TID <= tid && tid <= MAX_TID;
+	valid_adr(adr) = MIN_ADR <= adr && adr <= MAX_ADR;
+	MIN_TID = 0;
+    MAX_TID = 1;
+	(isB(adr) || isC(adr)) -> INIT(adr) = 1;
+	(isK(adr)) -> INIT(adr) = 0;
+    (isB(adr) || isC(adr)) -> MAX(adr) = 1;
+	(isK(adr)) -> MAX(adr) = MAX_TID;
+	MIN(adr) = 0;
+	MAX_BUFFER = 4;
+
+map
+	B: TID -> ADR;
+	C: TID -> ADR;
+	K: ADR;
+	isB: ADR -> Bool;
+	isC: ADR -> Bool;
+	isK: ADR -> Bool;
+var
+	tid: TID;
+	adr: ADR;
+eqn
+	B(tid) = tid*2;
+	C(tid) = tid*2+1;
+	MIN_ADR = MIN_TID;
+	MAX_ADR = (MAX_TID+1)*2;
+	K = MAX_ADR;
+	isB(adr) = ((adr mod 2) == 0 && adr < MAX_ADR);
+	isC(adr) = ((adr mod 2) == 1 && adr < MAX_ADR);
+	isK(adr) = (adr == MAX_ADR);
+
+sort
+    Data = Nat;
+map
+    MIN, MAX, INIT: ADR -> Data;
+    valid_data: Data # ADR -> Bool;
+var
+    d: Data;
+    adr: ADR;
+eqn
+    valid_data(d,adr) = MIN(adr) <= d && d <= MAX(adr);
+
+act
+	read_mm_r, read_mm_s, read_mm: TID # ADR # Data;
+	write_mm_r, write_mm_s, write_mm: TID # WriteAction;
+	write_buffer_r, write_buffer_s, write_buffer: WriteAction # TID;
+	read_buffer_r, read_buffer_s, read_buffer: TID # ADR # Data;
+	lock_r, lock_s, lock, unlock_r, unlock_s, unlock_sb, unlock: TID;
+	fence_r, fence_s, fence: TID;
+
+% Defines the main memory mapping
+sort
+	Memory_Map = ADR -> Data;
+map
+	getMemoryValue: Memory_Map # ADR -> Data;
+	setMemoryValue: Memory_Map # ADR # Data -> Memory_Map;
+	INIT_MM: Memory_Map;
+var
+	adr: ADR;
+	d: Data;
+	mm: Memory_Map;
+eqn
+	getMemoryValue(mm, adr) = mm(adr);
+	valid_data(d,adr) -> setMemoryValue(mm, adr, d) = mm[adr -> d];
+	INIT_MM(adr) = INIT(adr);
+
+% Defines a TSO buffer
+sort
+	WriteAction = struct write_action(getadr: ADR, getd: Data);
+	WriteBuffer = List(WriteAction);
+	WriteBufferPair = struct write_buffer_pair(buffer: WriteBuffer, action: WriteAction) | empty_buffer;
+map
+	push: WriteBuffer # WriteAction -> WriteBuffer;
+	pop: WriteBuffer -> WriteBufferPair;
+	read: WriteBuffer # ADR -> Data;
+var
+	wb: WriteBuffer;
+	wa: WriteAction;
+	adr: ADR;
+eqn
+	push(wb, wa) = wb <| wa;
+	#wb == 0 -> pop(wb) = empty_buffer;
+	#wb > 0 -> pop(wb) = write_buffer_pair(tail(wb), head(wb));
+	getadr(rhead(wb)) == adr -> read(wb, adr) = getd(rhead(wb));
+	getadr(rhead(wb)) != adr -> read(wb, adr) = read(rtail(wb), adr);
+	#wb == 0 -> read(wb, adr) = MAX(adr) + 1;
+
+proc
+	Main_Memory(mm: Memory_Map, lock: TID) = 
+		sum tid: TID . (
+			((valid_tid(tid) && (!valid_tid(lock) || tid == lock)) -> (	%Allow reading and writing when not locked or when lock is correct
+				sum adr: ADR . valid_adr(adr) -> (
+					(read_mm_r(tid, adr, getMemoryValue(mm, adr)) . Main_Memory(mm, lock)) +
+					(sum d: Data . valid_data(d, adr) -> (
+						write_mm_r(tid, write_action(adr, d)) . Main_Memory(setMemoryValue(mm, adr, d), lock)
+					))
+				)
+			)) +
+			((!valid_tid(lock)) -> (
+				lock_r(tid) . Main_Memory(mm, tid)
+			) <> (
+				unlock_r(lock) . Main_Memory(mm, MAX_TID + 1)
+			))
+		);
+
+proc
+	TSO_Buffer(tid: TID) = Buffer(tid, []);
+
+	Buffer(tid: TID, wb: WriteBuffer) =
+		((#wb < MAX_BUFFER) -> (sum adr: ADR . valid_adr(adr) -> (
+			(sum d: Data . valid_data(d, adr) -> (
+				write_buffer_r(write_action(adr, d), tid) . Buffer(tid, push(wb, write_action(adr, d)))))))) +
+		((#wb > 0) -> (
+			(write_mm_s(tid, action(pop(wb))) . Buffer(tid, buffer(pop(wb)))))) +
+		(sum adr: ADR . valid_adr(adr) -> (
+			valid_data(read(wb, adr), adr) -> (
+				read_buffer_r(tid, adr, read(wb, adr)) . Buffer(tid, wb)
+			) <> (
+				sum d: Data . read_mm_s(tid, adr, d) . Buffer(tid, wb)
+			)
+		)) +
+		((#wb == 0) -> ((unlock_sb(tid) + fence_r(tid)) . Buffer(tid, wb)));
+
+%% Algorithm specific actions or function definitions
+act
+	crit, noncrit: TID;
+	line: TID # Nat;
+
+%% Threads executing the algorithm 
+proc
+	Thread(tid: TID) =
+		noncrit(tid).
+		Thread_1(tid);
+
+	% Li0: b[i] := false
+	Thread_1(tid: TID) =
+		write_buffer_s(write_action(B(tid), 0), tid)|line(tid, 0).
+		Thread_2(tid);
+
+	% Li1: if k != i then Li2 else Li4
+	Thread_2(tid: TID) =
+		(sum f: Data . read_buffer_s(tid, K, f)|line(tid, 1). valid_data(f, K) -> (
+			(f != tid) -> (
+				Thread_3(tid)
+			) <> (
+				Thread_5(tid)
+			))
+		);
+
+	% Li2: c[i] := 1
+	Thread_3(tid: TID) =
+		write_buffer_s(write_action(C(tid), 1), tid)|line(tid, 2). %fence_s(tid). % Optional fence to limit state space and prove strong bisimilarity between buffer size 4 and 5
+		Thread_4(tid);
+
+	% Li3: if b[k] then k := i goto Li1
+	Thread_4(tid: TID) =
+		(sum k: Data . read_buffer_s(tid, K, k)|line(tid, 3). valid_data(k, K) -> (
+			sum b: Data . read_buffer_s(tid, B(k), b)|line(tid, 3). valid_data(b, B(k)) -> (
+				(b == 1) -> (
+					write_buffer_s(write_action(K, tid), tid)|line(tid, 3).
+					Thread_2(tid)
+				) <> (
+					Thread_2(tid)
+				)
+			)
+		));
+
+	% Li4: c[i] := false
+	Thread_5(tid: TID) =
+		write_buffer_s(write_action(C(tid), 0), tid)|line(tid, 4). fence_s(tid). 
+		Thread_6(tid, MIN_TID);
+
+	% Li5: for j = MIN_TID to MAX_TID if j != i and not c[j] goto Li1
+	Thread_6(tid, j: TID) =
+		(j <= MAX_TID) -> (
+			sum c: Data . read_buffer_s(tid, C(j), c)|line(tid, 5). valid_data(c, C(tid)) -> (
+				((j != tid) && (c == 0)) -> (
+					Thread_2(tid)
+				) <> (
+					Thread_6(tid, j+1)
+				)
+			)
+		) <> (
+			Thread_7(tid)
+		);
+
+	% Li6: crit
+	Thread_7(tid: TID) =
+		crit(tid).
+		Thread_8(tid);
+
+	% Li7: c[i] := true, b[i] := true then remainder 
+	Thread_8(tid: TID) =
+		write_buffer_s(write_action(C(tid), 1), tid)|line(tid, 6).
+		write_buffer_s(write_action(B(tid), 1), tid)|line(tid, 7).
+		Thread(tid);
+
+init
+	hide({line},
+    allow({
+		crit, noncrit, lock, unlock, fence, write_buffer|line, read_buffer|line, write_mm
+        },
+    comm({read_mm | read_buffer_s -> read_buffer}, comm({
+        read_mm_r | read_mm_s -> read_mm,
+        write_mm_r | write_mm_s -> write_mm,
+        write_buffer_r | write_buffer_s  -> write_buffer,
+		read_buffer_r | read_buffer_s -> read_buffer,
+		unlock_r | unlock_s | unlock_sb -> unlock,
+		lock_r | lock_s -> lock,
+		fence_r | fence_s -> fence
+        }, 
+       Main_Memory(INIT_MM, MAX_TID+1) || Thread(0) || TSO_Buffer(0) || Thread(1) || TSO_Buffer(1)% || Thread(2) || TSO_Buffer(2)
+  ))));
