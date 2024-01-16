@@ -1,1 +1,1 @@
-"# TSO-Mutual-Exclusion-mCRL2" 
+# TSO-Mutual-Exclusion-mCRL2
